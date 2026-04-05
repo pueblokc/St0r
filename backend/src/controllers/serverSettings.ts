@@ -2,6 +2,7 @@ import { Response } from 'express';
 import { AuthRequest } from '../middleware/auth.js';
 import { UrBackupDbService } from '../services/urbackupDb.js';
 import { UrBackupService } from '../services/urbackup.js';
+import { getSettingsDbPath, getDefaultUrBackupDir } from '../config/urbackupDb.js';
 import { logger } from '../utils/logger.js';
 import { readFile, writeFile } from 'fs/promises';
 import { existsSync } from 'fs';
@@ -80,7 +81,7 @@ async function getUrBackupSettings(): Promise<Record<string, string>> {
     const { open } = await import('sqlite');
 
     const settingsDb = await open({
-      filename: process.env.URBACKUP_DB_PATH?.replace('backup_server.db', 'backup_server_settings.db') || '/var/urbackup/backup_server_settings.db',
+      filename: getSettingsDbPath(),
       driver: sqlite3.default.Database,
       mode: sqlite3.default.OPEN_READONLY
     });
@@ -157,7 +158,7 @@ export async function getServerSettings(req: AuthRequest, res: Response): Promis
       ...DEFAULT_URBACKUP_SETTINGS,
 
       // Server configuration from environment
-      backupPath: dbSettings.backupfolder || urbackupSettings.backupfolder || process.env.URBACKUP_DB_PATH?.replace('/backup_server.db', '') || '/var/urbackup',
+      backupPath: dbSettings.backupfolder || urbackupSettings.backupfolder || process.env.URBACKUP_DB_PATH?.replace(/[/\\]backup_server\.db$/, '') || getDefaultUrBackupDir(),
       serverPort: process.env.URBACKUP_SERVER_PORT || '55414',
       serverFqdn: fqdn,
       internet_server: fqdn,  // Frontend uses this field name

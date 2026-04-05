@@ -1,9 +1,12 @@
 import { Request, Response } from 'express';
-import { execFile } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
 import { promisify } from 'util';
+import os from 'os';
 import { logger } from '../utils/logger.js';
 import { existsSync, truncateSync } from 'fs';
 import { readFile } from 'fs/promises';
+
+const isWindows = process.platform === 'win32';
 
 function compareVersionStrings(latest: string, installed: string): boolean {
   const a = latest.replace(/[^0-9.]/g, '').split('.').map(Number);
@@ -16,31 +19,38 @@ function compareVersionStrings(latest: string, installed: string): boolean {
   return false;
 }
 
-// --- /proc-based metrics helpers ---
+// --- Cross-platform system metrics helpers ---
 
-// CPU delta state
+// CPU delta state (cross-platform -- uses os.cpus() snapshots)
 let prevCpuStat: { total: number; idle: number } | null = null;
 let prevCpuTime = 0;
 
-// Network delta state
+// Network delta state -- Linux (/proc/net/dev)
 let prevNetStat: { iface: string; rx: bigint; tx: bigint } | null = null;
 let prevNetTime = 0;
 
-async function readProcFile(path: string): Promise<string> {
-  return readFile(path, 'utf-8');
+// Network delta state -- Windows (PowerShell Get-NetAdapterStatistics)
+let prevWinNetStat: { iface: string; rx: number; tx: number } | null = null;
+let prevWinNetTime = 0;
+
+async function readProcFile(filePath: string): Promise<string> {
+  return readFile(filePath, 'utf-8');
 }
 
+/** CPU usage via os.cpus() delta -- works on all platforms */
 async function getCpuUsage(): Promise<{ usage: number; cores: number; model: string }> {
-  const [statRaw, cpuinfoRaw] = await Promise.all([
-    readProcFile('/proc/stat'),
-    readProcFile('/proc/cpuinfo'),
-  ]);
+  const cpus = os.cpus();
+  const cores = cpus.length || 1;
+  const model = cpus[0]?.model || 'Unknown';
 
-  // Parse first cpu line: cpu user nice system idle iowait irq softirq steal ...
-  const cpuLine = statRaw.split('\n').find(l => l.startsWith('cpu '));
-  const fields = cpuLine!.trim().split(/\s+/).slice(1).map(Number);
-  const idle = fields[3] + (fields[4] || 0); // idle + iowait
-  const total = fields.reduce((a, b) => a + b, 0);
+  let idle = 0;
+  let total = 0;
+  for (const cpu of cpus) {
+    for (const type in cpu.times) {
+      total += cpu.times[type as keyof typeof cpu.times];
+    }
+    idle += cpu.times.idle;
+  }
 
   const now = Date.now();
   let usage = 0;
@@ -52,31 +62,78 @@ async function getCpuUsage(): Promise<{ usage: number; cores: number; model: str
   prevCpuStat = { total, idle };
   prevCpuTime = now;
 
-  const cores = (cpuinfoRaw.match(/^processor\s*:/gm) || []).length || 1;
-  const modelMatch = cpuinfoRaw.match(/^model name\s*:\s*(.+)/m);
-  const model = modelMatch ? modelMatch[1].trim() : 'Unknown';
-
   return { usage: Math.min(100, Math.max(0, usage)), cores, model };
 }
 
+/** Memory via os.totalmem()/os.freemem() -- works on all platforms */
 async function getMemoryUsage(): Promise<{ total: number; used: number; free: number; usagePercent: number }> {
-  const raw = await readProcFile('/proc/meminfo');
-  const get = (key: string) => {
-    const m = raw.match(new RegExp(`^${key}:\\s+(\\d+)`, 'm'));
-    return m ? parseInt(m[1], 10) * 1024 : 0; // kB → bytes
-  };
-  const total = get('MemTotal');
-  const available = get('MemAvailable');
-  const used = total - available;
+  const total = os.totalmem();
+  const free = os.freemem();
+  const used = total - free;
   const usagePercent = total > 0 ? Math.round((used / total) * 100) : 0;
-  return { total, used, free: available, usagePercent };
+  return { total, used, free, usagePercent };
 }
 
+/** Network usage -- dispatches to platform-specific implementation */
 async function getNetworkUsage(): Promise<{ iface: string; rxBytesPerSec: number; txBytesPerSec: number; linkSpeedMbps: number }> {
-  const raw = await readProcFile('/proc/net/dev');
   const now = Date.now();
+  if (isWindows) {
+    return getNetworkUsageWindows(now);
+  } else {
+    return getNetworkUsageLinux(now);
+  }
+}
 
-  // Parse all non-loopback interfaces
+/** Windows: Get-NetAdapterStatistics via PowerShell for traffic counters */
+async function getNetworkUsageWindows(now: number): Promise<{ iface: string; rxBytesPerSec: number; txBytesPerSec: number; linkSpeedMbps: number }> {
+  let bestIface = 'Ethernet';
+  let bestRx = 0;
+  let bestTx = 0;
+
+  try {
+    const psOutput = execFileSync('powershell', [
+      '-NoProfile', '-Command',
+      'Get-NetAdapterStatistics | Select-Object Name, ReceivedBytes, SentBytes | ConvertTo-Json -Compress'
+    ], { encoding: 'utf-8', timeout: 5000 });
+
+    const stats = JSON.parse(psOutput);
+    const adapters = Array.isArray(stats) ? stats : [stats];
+
+    for (const adapter of adapters) {
+      const rx = adapter.ReceivedBytes || 0;
+      const tx = adapter.SentBytes || 0;
+      if (rx + tx > bestRx + bestTx) {
+        bestIface = adapter.Name || 'Ethernet';
+        bestRx = rx;
+        bestTx = tx;
+      }
+    }
+  } catch (err) {
+    logger.debug('Failed to get Windows network stats via PowerShell:', err);
+  }
+
+  let rxRate = 0;
+  let txRate = 0;
+  const elapsed = (now - prevWinNetTime) / 1000;
+  if (prevWinNetStat && prevWinNetStat.iface === bestIface && elapsed > 0) {
+    rxRate = Math.max(0, (bestRx - prevWinNetStat.rx) / elapsed);
+    txRate = Math.max(0, (bestTx - prevWinNetStat.tx) / elapsed);
+  }
+  prevWinNetStat = { iface: bestIface, rx: bestRx, tx: bestTx };
+  prevWinNetTime = now;
+
+  // Link speed: env override -> fallback 1000 Mbps
+  let linkSpeedMbps = 1000;
+  const envSpeed = parseInt(process.env.NETWORK_LINK_SPEED_MBPS || '', 10);
+  if (envSpeed > 0) linkSpeedMbps = envSpeed;
+
+  return { iface: bestIface, rxBytesPerSec: Math.round(rxRate), txBytesPerSec: Math.round(txRate), linkSpeedMbps };
+}
+
+/** Linux: /proc/net/dev for traffic counters, /sys/class/net for link speed */
+async function getNetworkUsageLinux(now: number): Promise<{ iface: string; rxBytesPerSec: number; txBytesPerSec: number; linkSpeedMbps: number }> {
+  const raw = await readProcFile('/proc/net/dev');
+
   let bestIface = '';
   let bestRx = BigInt(0);
   let bestTx = BigInt(0);
@@ -92,7 +149,7 @@ async function getNetworkUsage(): Promise<{ iface: string; rxBytesPerSec: number
 
   let rxRate = 0;
   let txRate = 0;
-  const elapsed = (now - prevNetTime) / 1000; // seconds
+  const elapsed = (now - prevNetTime) / 1000;
   if (prevNetStat && prevNetStat.iface === bestIface && elapsed > 0) {
     rxRate = Math.max(0, Number(bestRx - prevNetStat.rx) / elapsed);
     txRate = Math.max(0, Number(bestTx - prevNetStat.tx) / elapsed);
@@ -100,7 +157,7 @@ async function getNetworkUsage(): Promise<{ iface: string; rxBytesPerSec: number
   prevNetStat = { iface: bestIface, rx: bestRx, tx: bestTx };
   prevNetTime = now;
 
-  // Read link speed: env override → sysfs → fallback 1000 Mbps
+  // Read link speed: env override -> sysfs -> fallback 1000 Mbps
   let linkSpeedMbps = 1000;
   const envSpeed = parseInt(process.env.NETWORK_LINK_SPEED_MBPS || '', 10);
   if (envSpeed > 0) {
@@ -124,9 +181,8 @@ export async function getSystemMetrics(req: Request, res: Response) {
       getNetworkUsage(),
     ]);
 
-    const uptimeRaw = await readProcFile('/proc/uptime');
-    const uptime = Math.floor(parseFloat(uptimeRaw.split(' ')[0]));
-    const hostname = (await readProcFile('/proc/sys/kernel/hostname')).trim();
+    const uptime = Math.floor(os.uptime());
+    const hostname = os.hostname();
 
     res.json({ cpu, memory, network, uptime, hostname });
   } catch (error: any) {
@@ -139,6 +195,11 @@ const execFileAsync = promisify(execFile);
 
 export async function triggerUpdate(req: Request, res: Response) {
   try {
+    if (isWindows) {
+      res.status(501).json({ error: 'GUI self-update is not supported on Windows. Please update manually.' });
+      return;
+    }
+
     const user = (req as any).user;
 
     // Only admins can trigger updates
@@ -152,7 +213,7 @@ export async function triggerUpdate(req: Request, res: Response) {
     // Execute the update script in the background
     const updateScript = '/opt/urbackup-gui/auto-update.sh';
 
-    // Check if script exists (no shell needed — use existsSync)
+    // Check if script exists (no shell needed -- use existsSync)
     if (!existsSync(updateScript)) {
       logger.error('Update script not found');
       res.status(500).json({
@@ -161,15 +222,6 @@ export async function triggerUpdate(req: Request, res: Response) {
       });
       return;
     }
-
-    // Start the update in the background
-    // The update script will:
-    // 1. Backup current installation
-    // 2. Download latest version
-    // 3. Stop service
-    // 4. Extract and install
-    // 5. Restart service
-    // 6. Restore backup if anything fails
 
     // If a previous update is still running, return success rather than failing
     try {
@@ -193,11 +245,10 @@ export async function triggerUpdate(req: Request, res: Response) {
     try {
       truncateSync(updateLogPath, 0);
     } catch (_e) {
-      // Log may not exist yet on first run — ignore
+      // Log may not exist yet on first run
     }
 
     // Run the script as root in the background via systemd-run.
-    // Use --property flags to redirect output instead of a shell pipeline.
     execFile('sudo', [
       'systemd-run',
       '--unit=urbackup-gui-update',
@@ -229,6 +280,11 @@ export async function triggerUpdate(req: Request, res: Response) {
 
 export async function getUpdateLog(req: Request, res: Response) {
   try {
+    if (isWindows) {
+      res.json({ log: 'GUI self-update is not supported on Windows.', inProgress: false });
+      return;
+    }
+
     const logFile = '/var/log/urbackup-gui-update.log';
 
     if (!existsSync(logFile)) {
@@ -245,7 +301,7 @@ export async function getUpdateLog(req: Request, res: Response) {
       const status = stdout.trim();
       inProgress = status === 'active' || status === 'activating';
     } catch (_e) {
-      // Non-zero exit means unit is inactive, failed, or not found — not running.
+      // Non-zero exit means unit is inactive, failed, or not found -- not running.
       inProgress = false;
     }
 
@@ -265,13 +321,23 @@ export async function getUpdateLog(req: Request, res: Response) {
 
 export async function getUrBackupServerVersion(req: Request, res: Response) {
   try {
-    // Installed version from dpkg
+    // Installed version
     let installed = 'unknown';
-    try {
-      const { stdout } = await execFileAsync('dpkg', ['-l', 'urbackup-server']);
-      const m = stdout.match(/^ii\s+urbackup-server\s+([\d.]+)/m);
-      if (m) installed = m[1];
-    } catch (_e) { /* dpkg unavailable or package not found */ }
+    if (isWindows) {
+      // On Windows, try reading version from the UrBackup install directory
+      try {
+        const versionFile = 'C:\\Program Files\\UrBackup\\version.txt';
+        if (existsSync(versionFile)) {
+          installed = (await readFile(versionFile, 'utf-8')).trim();
+        }
+      } catch (_e) { /* version file not found */ }
+    } else {
+      try {
+        const { stdout } = await execFileAsync('dpkg', ['-l', 'urbackup-server']);
+        const m = stdout.match(/^ii\s+urbackup-server\s+([\d.]+)/m);
+        if (m) installed = m[1];
+      } catch (_e) { /* dpkg unavailable or package not found */ }
+    }
 
     // Latest from GitHub
     let latest = 'unknown';
@@ -298,6 +364,11 @@ export async function getUrBackupServerVersion(req: Request, res: Response) {
 
 export async function triggerUrBackupServerUpdate(req: Request, res: Response) {
   try {
+    if (isWindows) {
+      res.status(501).json({ error: 'UrBackup server package update via apt is not supported on Windows. Please update manually.' });
+      return;
+    }
+
     const user = (req as any).user;
     if (!user?.isAdmin) {
       res.status(403).json({ error: 'Only administrators can trigger updates' });
@@ -342,6 +413,11 @@ export async function triggerUrBackupServerUpdate(req: Request, res: Response) {
 
 export async function getUrBackupUpdateLog(req: Request, res: Response) {
   try {
+    if (isWindows) {
+      res.json({ log: 'UrBackup server update via apt is not supported on Windows.', inProgress: false });
+      return;
+    }
+
     const logFile = '/var/log/urbackup-server-update.log';
     if (!existsSync(logFile)) {
       res.json({ log: '', inProgress: false });

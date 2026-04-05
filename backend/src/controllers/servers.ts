@@ -12,9 +12,11 @@ import { existsSync } from 'fs';
 // Also import local system functions for the "local" server
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import os from 'os';
 import { readFile } from 'fs/promises';
 
 const execFileAsync = promisify(execFile);
+const isWindows = process.platform === 'win32';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // Path to the bundled agent directory (relative to this compiled file location)
@@ -242,7 +244,37 @@ export async function getMetrics(req: Request, res: Response) {
     const server = rows[0];
 
     if (server.is_local) {
-      // Use local /proc files (same as system.ts)
+      if (isWindows) {
+        // Windows: use os module for basic metrics
+        const cpus = os.cpus();
+        const totalMem = os.totalmem();
+        const freeMem = os.freemem();
+        const usedMem = totalMem - freeMem;
+
+        const cpu = { usage: 0, cores: cpus.length, model: cpus[0]?.model || 'Unknown', _total: 0, _idle: 0 };
+        const memory = { total: totalMem, used: usedMem, free: freeMem, usagePercent: totalMem > 0 ? Math.round((usedMem / totalMem) * 100) : 0 };
+        const disk = { total: 0, used: 0, available: 0, usagePercent: 0 };
+
+        // Try to get disk info via PowerShell
+        try {
+          const { stdout: psOut } = await execFileAsync('powershell', ['-NoProfile', '-Command',
+            "Get-PSDrive C | Select-Object @{N='Used';E={$_.Used}},@{N='Free';E={$_.Free}} | ConvertTo-Json"]);
+          const driveInfo = JSON.parse(psOut.trim());
+          disk.used = driveInfo.Used || 0;
+          disk.available = driveInfo.Free || 0;
+          disk.total = disk.used + disk.available;
+          disk.usagePercent = disk.total > 0 ? Math.round((disk.used / disk.total) * 100) : 0;
+        } catch { /* PowerShell disk check failed, leave zeros */ }
+
+        const network = { iface: 'N/A', rxBytesPerSec: 0, txBytesPerSec: 0 };
+        const uptime = os.uptime();
+
+        await query('UPDATE managed_servers SET last_seen = ? WHERE id = ?', [Date.now(), req.params.id]);
+        res.json({ cpu, memory, disk, network, uptime, hostname: os.hostname() });
+        return;
+      }
+
+      // Linux: Use local /proc files (same as system.ts)
       const [statRaw, cpuinfoRaw, memRaw, netRaw, uptimeRaw, hostnameRaw] = await Promise.all([
         readFile('/proc/stat', 'utf-8'),
         readFile('/proc/cpuinfo', 'utf-8'),
@@ -339,6 +371,11 @@ export async function testSsh(req: Request, res: Response) {
 // ---- Install Agent ----
 
 export async function installAgent(req: Request, res: Response) {
+  if (isWindows) {
+    res.status(501).json({ error: 'Agent deployment via SSH is not supported from a Windows host. Install the agent manually on the remote server, then register the API key here.' });
+    return;
+  }
+
   const user = (req as any).user;
   if (!user?.isAdmin) { res.status(403).json({ error: 'Admins only' }); return; }
 
@@ -443,6 +480,10 @@ export async function getOsUpdates(req: Request, res: Response) {
     const server = rows[0];
 
     if (server.is_local) {
+      if (isWindows) {
+        res.status(501).json({ error: 'OS update checking is not supported on Windows. Use Windows Update directly.' });
+        return;
+      }
       // Use cached apt data — no sudo needed, and apt-get update runs as root during Apply OS Updates
       const { stdout } = await execFileAsync('apt', ['list', '--upgradable', '--quiet=2']);
       const packages = stdout.trim().split('\n').filter((l: string) => l && !l.startsWith('Listing') && l.trim() !== '');
@@ -467,6 +508,10 @@ export async function triggerOsUpdate(req: Request, res: Response) {
     const server = rows[0];
 
     if (server.is_local) {
+      if (isWindows) {
+        res.status(501).json({ error: 'OS updates are not supported on Windows via this interface. Use Windows Update directly.' });
+        return;
+      }
       const { truncateSync, existsSync: es } = await import('fs');
       const logFile = '/var/log/stor-os-update.log';
       try { await execFileAsync('systemctl', ['reset-failed', 'stor-local-os-update.service']); } catch { /* ok */ }
@@ -496,6 +541,10 @@ export async function getOsUpdateLog(req: Request, res: Response) {
     const server = rows[0];
 
     if (server.is_local) {
+      if (isWindows) {
+        res.json({ log: 'OS update log is not available on Windows.', inProgress: false });
+        return;
+      }
       const logFile = '/var/log/stor-os-update.log';
       let log = '';
       try { log = await readFile(logFile, 'utf-8'); } catch { /* not exists */ }
@@ -527,6 +576,13 @@ export async function rebootServer(req: Request, res: Response) {
     const server = rows[0];
 
     if (server.is_local) {
+      if (isWindows) {
+        res.json({ success: true, message: 'Rebooting in 5 seconds' });
+        setTimeout(async () => {
+          try { await execFileAsync('shutdown', ['/r', '/t', '5']); } catch (e) { logger.error('[servers] reboot:', e); }
+        }, 5000);
+        return;
+      }
       res.json({ success: true, message: 'Rebooting in 5 seconds' });
       setTimeout(async () => {
         try { await execFileAsync('sudo', ['systemctl', 'reboot']); } catch (e) { logger.error('[servers] reboot:', e); }
@@ -762,6 +818,11 @@ fi
  * This means the remote server can download the agent without any stored credentials.
  */
 export async function serveAgentPackage(req: Request, res: Response) {
+  if (isWindows) {
+    res.status(501).json({ error: 'Agent package serving is not supported on Windows.' });
+    return;
+  }
+
   const { token } = req.params;
   if (!token || !/^[a-f0-9]{64}$/.test(token)) {
     res.status(400).json({ error: 'Invalid token' });

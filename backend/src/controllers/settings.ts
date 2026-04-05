@@ -6,6 +6,7 @@ import { existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, resolve } from 'path';
 import { UrBackupService } from '../services/urbackup.js';
+import { getSettingsDbPath } from '../config/urbackupDb.js';
 import { execFile } from 'child_process';
 
 // Resolve .env relative to this file so it works in both dev (src/controllers/)
@@ -164,15 +165,27 @@ export async function updateSettings(req: AuthRequest, res: Response): Promise<v
         if (!/^[a-zA-Z0-9.\-]+$/.test(fqdnForUrBackup)) {
           logger.warn(`FQDN contains invalid characters, skipping DB write: ${fqdnForUrBackup}`);
         } else {
-          const dbPath = '/var/urbackup/backup_server_settings.db';
+          const dbPath = getSettingsDbPath();
           // Pass SQL via stdin (not as a CLI argument) to prevent any injection risk
           const sql = `DELETE FROM settings WHERE key='internet_server' AND clientid=0;\nINSERT INTO settings (key, value, clientid) VALUES ('internet_server', '${fqdnForUrBackup}', 0);\n`;
-          const child = execFile('sudo', ['-u', 'urbackup', 'sqlite3', dbPath], (err) => {
-            if (err) logger.warn(`Could not write internet_server to UrBackup DB: ${err.message}`);
-            else logger.info(`Wrote internet_server=${fqdnForUrBackup} to UrBackup DB directly`);
-          });
-          child.stdin?.write(sql);
-          child.stdin?.end();
+          const isWin = process.platform === 'win32';
+          if (isWin) {
+            // On Windows, no sudo needed — use sqlite3 directly (or the npm sqlite3 package via urbackupDb)
+            // Try to use sqlite3 CLI if available, otherwise log a warning
+            const child = execFile('sqlite3', [dbPath], (err) => {
+              if (err) logger.warn(`Could not write internet_server to UrBackup DB: ${err.message}. You may need to install sqlite3 CLI or update the setting manually.`);
+              else logger.info(`Wrote internet_server=${fqdnForUrBackup} to UrBackup DB directly`);
+            });
+            child.stdin?.write(sql);
+            child.stdin?.end();
+          } else {
+            const child = execFile('sudo', ['-u', 'urbackup', 'sqlite3', dbPath], (err) => {
+              if (err) logger.warn(`Could not write internet_server to UrBackup DB: ${err.message}`);
+              else logger.info(`Wrote internet_server=${fqdnForUrBackup} to UrBackup DB directly`);
+            });
+            child.stdin?.write(sql);
+            child.stdin?.end();
+          }
         }
       }
     }

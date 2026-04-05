@@ -1,7 +1,11 @@
+import path from 'path';
 import { logger } from '../utils/logger.js';
 import { UrBackupDbService } from './urbackupDb.js';
-import { openUrBackupSettingsDbReadWrite } from '../config/urbackupDb.js';
+import { openUrBackupSettingsDbReadWrite, getDefaultUrBackupDir } from '../config/urbackupDb.js';
 import { execFileSync } from 'child_process';
+import { readFileSync } from 'fs';
+
+const isWindows = process.platform === 'win32';
 
 // For write operations, we still need to communicate with the UrBackup server
 // Since we're running on the same server, we can use localhost
@@ -180,10 +184,22 @@ export class UrBackupService {
   private parseCurrentTransferProgress(clientId: number): any | null {
     try {
       // Read last 200 lines from urbackup log and find the latest progress line in JS
-      const tailOutput = execFileSync('tail', ['-200', '/var/log/urbackup.log'], {
-        encoding: 'utf-8',
-        timeout: 5000,
-      });
+      const logPath = isWindows
+        ? path.join('C:', 'Program Files', 'UrBackup', 'urbackup', 'urbackup.log')
+        : '/var/log/urbackup.log';
+
+      let tailOutput: string;
+      if (isWindows) {
+        // Windows doesn't have tail; read the file and take last 200 lines
+        const fullLog = readFileSync(logPath, 'utf-8');
+        const lines = fullLog.split('\n');
+        tailOutput = lines.slice(-200).join('\n');
+      } else {
+        tailOutput = execFileSync('tail', ['-200', logPath], {
+          encoding: 'utf-8',
+          timeout: 5000,
+        });
+      }
       const progressLines = tailOutput.split('\n').filter(l => l.includes('% finished'));
       const logOutput = (progressLines[progressLines.length - 1] ?? '').trim();
 

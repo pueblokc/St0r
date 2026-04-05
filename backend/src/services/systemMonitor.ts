@@ -78,25 +78,35 @@ export class SystemMonitor {
   }
 
   /**
-   * Get disk information for the root filesystem
+   * Get disk information for the root filesystem (cross-platform)
    */
   async getDiskInfo() {
     try {
-      const { stdout } = await execFileAsync('df', ['-B1', '/']);
-      const lines = stdout.trim().split('\n');
-      const parts = lines[lines.length - 1].split(/\s+/);
+      if (process.platform === 'win32') {
+        // Windows: use PowerShell to get drive info for C:
+        const { stdout } = await execFileAsync('powershell', [
+          '-NoProfile', '-Command',
+          'Get-PSDrive C | Select-Object Used, Free | ConvertTo-Json -Compress'
+        ]);
+        const info = JSON.parse(stdout.trim());
+        const used = info.Used || 0;
+        const free = info.Free || 0;
+        const total = used + free;
+        const usagePercent = total > 0 ? Math.round((used / total) * 100) : 0;
+        return { total, used, free, usagePercent };
+      } else {
+        // Linux: use df
+        const { stdout } = await execFileAsync('df', ['-B1', '/']);
+        const lines = stdout.trim().split('\n');
+        const parts = lines[lines.length - 1].split(/\s+/);
 
-      const total = parseInt(parts[1]);
-      const used = parseInt(parts[2]);
-      const free = parseInt(parts[3]);
-      const usagePercent = parseInt(parts[4]);
+        const total = parseInt(parts[1]);
+        const used = parseInt(parts[2]);
+        const free = parseInt(parts[3]);
+        const usagePercent = parseInt(parts[4]);
 
-      return {
-        total,
-        used,
-        free,
-        usagePercent
-      };
+        return { total, used, free, usagePercent };
+      }
     } catch (error) {
       logger.error('Failed to get disk info:', error);
       return {

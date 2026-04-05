@@ -1,7 +1,34 @@
 import { Request, Response } from 'express';
+import path from 'path';
 import { logger } from '../utils/logger.js';
 import { UrBackupDbService } from '../services/urbackupDb.js';
 import { realpathSync } from 'fs';
+import { getDefaultUrBackupDir } from '../config/urbackupDb.js';
+
+const isWindows = process.platform === 'win32';
+
+/**
+ * Read the backup folder location from UrBackup's config file.
+ * On Linux: /var/urbackup/backupfolder
+ * On Windows: C:\Program Files\UrBackup\urbackup\backupfolder
+ * Falls back to platform-appropriate defaults.
+ */
+async function readBackupFolder(fsModule: typeof import('fs/promises')): Promise<string> {
+  const backupFolderFile = isWindows
+    ? path.join('C:', 'Program Files', 'UrBackup', 'urbackup', 'backupfolder')
+    : '/var/urbackup/backupfolder';
+  const defaultBackupFolder = isWindows
+    ? path.join('C:', 'UrBackupData')
+    : '/media/BACKUP/urbackup';
+
+  try {
+    const content = await fsModule.readFile(backupFolderFile, 'utf-8');
+    return content.trim();
+  } catch (err) {
+    logger.warn(`Could not read ${backupFolderFile}, using default: ${defaultBackupFolder}`);
+    return defaultBackupFolder;
+  }
+}
 
 const dbService = new UrBackupDbService();
 
@@ -81,14 +108,8 @@ export async function getFilesInBackup(req: Request, res: Response): Promise<voi
     const fs = await import('fs/promises');
     const pathModule = await import('path');
 
-    // Read backup folder location from /var/urbackup/backupfolder
-    let backupFolder = '/media/BACKUP/urbackup'; // default
-    try {
-      const backupFolderContent = await fs.readFile('/var/urbackup/backupfolder', 'utf-8');
-      backupFolder = backupFolderContent.trim();
-    } catch (err) {
-      logger.warn('Could not read /var/urbackup/backupfolder, using default');
-    }
+    // Read backup folder location (platform-aware)
+    const backupFolder = await readBackupFolder(fs);
 
     // Get client info to get client name
     const clients = await dbService.getClients();
@@ -123,7 +144,8 @@ export async function getFilesInBackup(req: Request, res: Response): Promise<voi
       res.status(404).json({ error: 'Path not found in backup' });
       return;
     }
-    if (!resolvedFull.startsWith(resolvedBase + '/') && resolvedFull !== resolvedBase) {
+    const pathSep = isWindows ? '\\' : '/';
+    if (!resolvedFull.startsWith(resolvedBase + pathSep) && resolvedFull !== resolvedBase) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
@@ -210,14 +232,8 @@ export async function downloadFile(req: Request, res: Response): Promise<void> {
     const pathModule = await import('path');
     const fs = await import('fs');
 
-    // Read backup folder location
-    let backupFolder = '/media/BACKUP/urbackup';
-    try {
-      const backupFolderContent = await fs.promises.readFile('/var/urbackup/backupfolder', 'utf-8');
-      backupFolder = backupFolderContent.trim();
-    } catch (err) {
-      logger.warn('Could not read /var/urbackup/backupfolder, using default');
-    }
+    // Read backup folder location (platform-aware)
+    const backupFolder = await readBackupFolder(fs.promises);
 
     // Get client info
     const clients = await dbService.getClients();
@@ -246,7 +262,8 @@ export async function downloadFile(req: Request, res: Response): Promise<void> {
       res.status(404).json({ error: 'File not found' });
       return;
     }
-    if (!resolvedDlFull.startsWith(resolvedDlBase + '/') && resolvedDlFull !== resolvedDlBase) {
+    const dlPathSep = isWindows ? '\\' : '/';
+    if (!resolvedDlFull.startsWith(resolvedDlBase + dlPathSep) && resolvedDlFull !== resolvedDlBase) {
       logger.error(`Security check failed: ${resolvedDlFull} does not start with ${resolvedDlBase}`);
       res.status(403).json({ error: 'Invalid file path' });
       return;
@@ -316,11 +333,8 @@ export async function downloadFolder(req: Request, res: Response): Promise<void>
     const pathModule = await import('path');
     const fs = await import('fs');
 
-    let backupFolder = '/media/BACKUP/urbackup';
-    try {
-      const bf = await fs.promises.readFile('/var/urbackup/backupfolder', 'utf-8');
-      backupFolder = bf.trim();
-    } catch { /* use default */ }
+    // Read backup folder location (platform-aware)
+    const backupFolder = await readBackupFolder(fs.promises);
 
     const clients = await dbService.getClients();
     const client = clients.find(c => c.id === Number(clientId));
@@ -334,7 +348,8 @@ export async function downloadFolder(req: Request, res: Response): Promise<void>
     let resolvedFull: string;
     try { resolvedBase = realpathSync(backupBasePath); } catch { res.status(404).json({ error: 'Backup path not found' }); return; }
     try { resolvedFull = realpathSync(fullPath); } catch { res.status(404).json({ error: 'Folder not found' }); return; }
-    if (!resolvedFull.startsWith(resolvedBase + '/') && resolvedFull !== resolvedBase) {
+    const folderPathSep = isWindows ? '\\' : '/';
+    if (!resolvedFull.startsWith(resolvedBase + folderPathSep) && resolvedFull !== resolvedBase) {
       res.status(403).json({ error: 'Invalid path' }); return;
     }
 
@@ -349,14 +364,35 @@ export async function downloadFolder(req: Request, res: Response): Promise<void>
     res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(zipName)}`);
 
     const { spawn } = await import('child_process');
-    // zip -r - . streams a zip of the current directory to stdout
-    const zip = spawn('zip', ['-r', '-', '.'], { cwd: resolvedFull, stdio: ['ignore', 'pipe', 'ignore'] });
-    zip.stdout.pipe(res);
-    zip.on('error', (e) => {
-      logger.error('[browse] zip error:', e);
-      if (!res.headersSent) res.status(500).json({ error: 'Failed to create zip' });
-      else res.destroy();
-    });
+
+    if (isWindows) {
+      // Windows: Use PowerShell Compress-Archive to create zip, then stream it
+      const os = await import('os');
+      const tmpZip = pathModule.join(os.tmpdir(), `st0r-zip-${Date.now()}.zip`);
+      const psCmd = `Compress-Archive -Path '${resolvedFull}\\*' -DestinationPath '${tmpZip}' -Force; [Console]::OpenStandardOutput().Write([System.IO.File]::ReadAllBytes('${tmpZip}')); Remove-Item '${tmpZip}' -Force`;
+      const zip = spawn('powershell', ['-NoProfile', '-Command', psCmd], { stdio: ['ignore', 'pipe', 'pipe'] });
+      zip.stdout.pipe(res);
+      zip.on('error', (e) => {
+        logger.error('[browse] PowerShell zip error:', e);
+        if (!res.headersSent) res.status(500).json({ error: 'Failed to create zip' });
+        else res.destroy();
+      });
+      zip.on('close', () => {
+        // Cleanup temp file if it still exists
+        import('fs').then(fsSync => {
+          try { fsSync.unlinkSync(tmpZip); } catch { /* already deleted */ }
+        });
+      });
+    } else {
+      // Linux: zip -r - . streams a zip of the current directory to stdout
+      const zip = spawn('zip', ['-r', '-', '.'], { cwd: resolvedFull, stdio: ['ignore', 'pipe', 'ignore'] });
+      zip.stdout.pipe(res);
+      zip.on('error', (e) => {
+        logger.error('[browse] zip error:', e);
+        if (!res.headersSent) res.status(500).json({ error: 'Failed to create zip' });
+        else res.destroy();
+      });
+    }
   } catch (error) {
     logger.error('Failed to download folder:', error);
     if (!res.headersSent) res.status(500).json({ error: 'Failed to download folder' });

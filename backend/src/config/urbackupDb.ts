@@ -1,12 +1,35 @@
 import sqlite3 from 'sqlite3';
 import { open, Database } from 'sqlite';
+import path from 'path';
 import { logger } from '../utils/logger.js';
 
 let db: Database | null = null;
 
-// Default UrBackup database path on Linux
-const URBACKUP_DB_PATH = process.env.URBACKUP_DB_PATH || '/var/urbackup/backup_server.db';
+// Platform-aware default UrBackup database path
+const isWindows = process.platform === 'win32';
+const DEFAULT_URBACKUP_DB_PATH = isWindows
+  ? path.join('C:', 'Program Files', 'UrBackup', 'urbackup', 'backup_server.db')
+  : '/var/urbackup/backup_server.db';
+
+const URBACKUP_DB_PATH = process.env.URBACKUP_DB_PATH || DEFAULT_URBACKUP_DB_PATH;
 const URBACKUP_SETTINGS_DB_PATH = URBACKUP_DB_PATH.replace('backup_server.db', 'backup_server_settings.db');
+
+/**
+ * Get the platform-aware default path for the UrBackup data directory
+ */
+export function getDefaultUrBackupDir(): string {
+  return isWindows
+    ? path.join('C:', 'Program Files', 'UrBackup', 'urbackup')
+    : '/var/urbackup';
+}
+
+/**
+ * Derive the settings DB path from env or platform default
+ */
+export function getSettingsDbPath(): string {
+  return process.env.URBACKUP_DB_PATH?.replace('backup_server.db', 'backup_server_settings.db')
+    || URBACKUP_SETTINGS_DB_PATH;
+}
 
 /**
  * Open a connection to the UrBackup SQLite database

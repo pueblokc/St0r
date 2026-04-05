@@ -1,7 +1,7 @@
 import { execFile as execFileCb } from 'child_process';
 import { promisify } from 'util';
 import { resolve, dirname } from 'path';
-import { getUrBackupDb, openUrBackupDbReadWrite } from '../config/urbackupDb.js';
+import { getUrBackupDb, openUrBackupDbReadWrite, getSettingsDbPath, getDefaultUrBackupDir } from '../config/urbackupDb.js';
 const execFile = promisify(execFileCb);
 import { logger } from '../utils/logger.js';
 import { pool } from '../config/database.js';
@@ -635,21 +635,21 @@ export class UrBackupDbService {
 
   /**
    * Get the UrBackup backup storage folder path from backup_server_settings.db.
-   * Falls back to /var/urbackup if not found (UrBackup default).
+   * Falls back to a platform-appropriate default if not found.
    */
   async getBackupFolder(): Promise<string> {
+    const defaultDir = getDefaultUrBackupDir();
     try {
       const { open } = await import('sqlite');
       const sqlite3 = await import('sqlite3');
-      const settingsPath = process.env.URBACKUP_DB_PATH?.replace('backup_server.db', 'backup_server_settings.db')
-        || '/var/urbackup/backup_server_settings.db';
+      const settingsPath = getSettingsDbPath();
       const settingsDb = await open({ filename: settingsPath, driver: sqlite3.default.Database });
       const row = await settingsDb.get(`SELECT value FROM settings WHERE key='backupfolder' AND clientid=0 LIMIT 1`);
       await settingsDb.close();
-      return resolve(row?.value || '/var/urbackup');
+      return resolve(row?.value || defaultDir);
     } catch (err) {
-      logger.warn('Could not read backupfolder from settings DB, using /var/urbackup:', err);
-      return '/var/urbackup';
+      logger.warn(`Could not read backupfolder from settings DB, using ${defaultDir}:`, err);
+      return defaultDir;
     }
   }
 
@@ -681,7 +681,7 @@ export class UrBackupDbService {
       const sqlite3 = await import('sqlite3');
       const { open } = await import('sqlite');
       settingsDb = await open({
-        filename: process.env.URBACKUP_DB_PATH?.replace('backup_server.db', 'backup_server_settings.db') || '/var/urbackup/backup_server_settings.db',
+        filename: getSettingsDbPath(),
         driver: sqlite3.default.Database,
         mode: sqlite3.default.OPEN_READWRITE
       });
@@ -828,7 +828,7 @@ export class UrBackupDbService {
       const sqlite3 = await import('sqlite3');
       const { open } = await import('sqlite');
       settingsDb = await open({
-        filename: process.env.URBACKUP_DB_PATH?.replace('backup_server.db', 'backup_server_settings.db') || '/var/urbackup/backup_server_settings.db',
+        filename: getSettingsDbPath(),
         driver: sqlite3.default.Database,
         mode: sqlite3.default.OPEN_READWRITE
       });
@@ -854,7 +854,7 @@ export class UrBackupDbService {
       const sqlite3 = await import('sqlite3');
       const { open } = await import('sqlite');
       db = await open({
-        filename: process.env.URBACKUP_DB_PATH?.replace('backup_server.db', 'backup_server_settings.db') || '/var/urbackup/backup_server_settings.db',
+        filename: getSettingsDbPath(),
         driver: sqlite3.default.Database,
         mode: sqlite3.default.OPEN_READONLY
       });

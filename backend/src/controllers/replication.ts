@@ -7,6 +7,7 @@ import { replicationEngine } from '../services/replicationEngine.js';
 import type { AuthRequest } from '../middleware/auth.js';
 import { logger } from '../utils/logger.js';
 
+const isWindows = process.platform === 'win32';
 const REDACTED = '***REDACTED***';
 
 function redactTarget(t: any): any {
@@ -248,6 +249,11 @@ export async function deleteTarget(req: AuthRequest, res: Response): Promise<voi
 }
 
 export async function testTarget(req: AuthRequest, res: Response): Promise<void> {
+  if (isWindows) {
+    res.status(501).json({ error: 'Replication is not supported on Windows.' });
+    return;
+  }
+
   try {
     const { id } = req.params;
     const rows = await query<any[]>('SELECT * FROM replication_targets WHERE id = ?', [id]);
@@ -289,6 +295,11 @@ export async function testTarget(req: AuthRequest, res: Response): Promise<void>
 }
 
 export async function triggerRun(req: AuthRequest, res: Response): Promise<void> {
+  if (isWindows) {
+    res.status(501).json({ error: 'Replication is not supported on Windows. This feature requires rsync, btrfs, and SSH tools only available on Linux.' });
+    return;
+  }
+
   try {
     const { id } = req.params;
     const rows = await query<any[]>('SELECT id, enabled FROM replication_targets WHERE id = ?', [id]);

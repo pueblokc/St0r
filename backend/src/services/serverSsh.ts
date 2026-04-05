@@ -139,6 +139,10 @@ export async function installAgentViaSsh(
   agentDir: string,
   agentPort: number
 ): Promise<{ ok: boolean; apiKey?: string; error?: string }> {
+  if (process.platform === 'win32') {
+    return { ok: false, error: 'Agent deployment via SSH is not supported on Windows. The pack/deploy commands require bash, tar, and base64 which are Linux-specific. Install the agent manually on the remote server.' };
+  }
+
   let client: SshClient | null = null;
   try {
     client = await connectSsh(target);

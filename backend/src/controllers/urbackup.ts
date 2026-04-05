@@ -531,7 +531,9 @@ export async function browseClientFilesystem(req: AuthRequest, res: Response): P
 
 export async function convertAndDownloadImageBackup(req: AuthRequest, res: Response): Promise<void> {
   const { clientId, backupId } = req.params;
-  const tmpDir = `/tmp/urbackup-export-${randomUUID()}`;
+  const isWin = process.platform === 'win32';
+  const os = await import('os');
+  const tmpDir = path.join(os.tmpdir(), `urbackup-export-${randomUUID()}`);
   let tmpFile: string | null = null;
 
   try {
@@ -556,7 +558,7 @@ export async function convertAndDownloadImageBackup(req: AuthRequest, res: Respo
     const isCompressed = srcPath.endsWith('.vhdz');
 
     if (!isCompressed) {
-      // Already a plain VHD — stream directly
+      // Already a plain VHD -- stream directly
       const fileName = path.basename(srcPath).replace(/\.vhd$/, '') + '.vhd';
       res.setHeader('Content-Type', 'application/octet-stream');
       res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
@@ -568,50 +570,77 @@ export async function convertAndDownloadImageBackup(req: AuthRequest, res: Respo
     // Estimate decompressed size (VHD = full disk size, typically 3-5x compressed)
     const estimatedVhdBytes = srcStat.size * 5;
 
-    // Check free space in /tmp
-    const dfResult = await new Promise<string>((resolve, reject) => {
-      const p = spawn('df', ['-B1', '--output=avail', '/tmp']);
-      let out = '';
-      p.stdout.on('data', (d: Buffer) => { out += d.toString(); });
-      p.on('close', (code: number) => code === 0 ? resolve(out) : reject(new Error('df failed')));
-    });
-    const availBytes = parseInt(dfResult.trim().split('\n')[1] || '0');
+    // Check free space in temp directory
+    let availBytes = 0;
+    const tmpRoot = os.tmpdir();
+    if (isWin) {
+      try {
+        const { execFile: ef } = await import('child_process');
+        const { promisify: p } = await import('util');
+        const efAsync = p(ef);
+        const driveLetter = tmpRoot.charAt(0);
+        const { stdout } = await efAsync('powershell', ['-NoProfile', '-Command',
+          `(Get-PSDrive ${driveLetter}).Free`]);
+        availBytes = parseInt(stdout.trim()) || 0;
+      } catch { availBytes = Number.MAX_SAFE_INTEGER; /* skip check if PowerShell fails */ }
+    } else {
+      const dfResult = await new Promise<string>((resolve, reject) => {
+        const p = spawn('df', ['-B1', '--output=avail', tmpRoot]);
+        let out = '';
+        p.stdout.on('data', (d: Buffer) => { out += d.toString(); });
+        p.on('close', (code: number) => code === 0 ? resolve(out) : reject(new Error('df failed')));
+      });
+      availBytes = parseInt(dfResult.trim().split('\n')[1] || '0');
+    }
     const needBytes = srcStat.size + estimatedVhdBytes;
 
     if (availBytes < needBytes) {
       res.status(507).json({
-        error: `Not enough disk space to convert. Need ~${(needBytes / 1e9).toFixed(1)} GB free in /tmp, have ${(availBytes / 1e9).toFixed(1)} GB.`
+        error: `Not enough disk space to convert. Need ~${(needBytes / 1e9).toFixed(1)} GB free in temp, have ${(availBytes / 1e9).toFixed(1)} GB.`
       });
       return;
     }
 
     // Copy to temp dir so decompress-file doesn't touch the original backup
     fs.mkdirSync(tmpDir, { recursive: true });
-    fs.chmodSync(tmpDir, 0o750); // urbackup user needs write access to rename .vhdz.tmp → output
+    try { fs.chmodSync(tmpDir, 0o750); } catch { /* chmod not supported on Windows, skip */ }
     const fileName = path.basename(srcPath);
     tmpFile = path.join(tmpDir, fileName);
 
-    logger.info(`[convertVhd] Copying ${srcPath} → ${tmpFile} (${(srcStat.size / 1e9).toFixed(1)} GB)`);
+    logger.info(`[convertVhd] Copying ${srcPath} -> ${tmpFile} (${(srcStat.size / 1e9).toFixed(1)} GB)`);
     await fs.promises.copyFile(srcPath, tmpFile);
-    fs.chmodSync(tmpFile, 0o644); // urbackup user (internal drop) needs read access
+    try { fs.chmodSync(tmpFile, 0o644); } catch { /* chmod not supported on Windows, skip */ }
 
     // Decompress in-place inside tmpDir
     logger.info(`[convertVhd] Decompressing ${tmpFile}`);
-    await new Promise<void>((resolve, reject) => {
-      const proc = spawn('sudo', ['urbackupsrv', 'decompress-file', '-f', tmpFile!]);
-      proc.stderr.on('data', (d: Buffer) => logger.debug(`[decompress-file] ${d.toString().trim()}`));
-      proc.on('close', (code: number) => code === 0 ? resolve() : reject(new Error(`decompress-file exited ${code}`)));
-    });
+    if (isWin) {
+      // On Windows, urbackupsrv.exe is in Program Files
+      const urbackupSrv = 'C:\\Program Files\\UrBackup\\urbackupsrv.exe';
+      await new Promise<void>((resolve, reject) => {
+        const proc = spawn(urbackupSrv, ['decompress-file', '-f', tmpFile!]);
+        proc.stderr.on('data', (d: Buffer) => logger.debug(`[decompress-file] ${d.toString().trim()}`));
+        proc.on('close', (code: number) => code === 0 ? resolve() : reject(new Error(`decompress-file exited ${code}`)));
+        proc.on('error', (err) => reject(new Error(`Failed to run urbackupsrv.exe: ${err.message}`)));
+      });
+    } else {
+      await new Promise<void>((resolve, reject) => {
+        const proc = spawn('sudo', ['urbackupsrv', 'decompress-file', '-f', tmpFile!]);
+        proc.stderr.on('data', (d: Buffer) => logger.debug(`[decompress-file] ${d.toString().trim()}`));
+        proc.on('close', (code: number) => code === 0 ? resolve() : reject(new Error(`decompress-file exited ${code}`)));
+      });
+    }
 
     if (!fs.existsSync(tmpFile)) {
       throw new Error('Decompressed file not found after conversion');
     }
 
-    // After decompress, file is owned by urbackup — make it world-readable so Node can stream it
-    await new Promise<void>((resolve, reject) => {
-      const proc = spawn('sudo', ['chmod', '644', tmpFile!]);
-      proc.on('close', (code: number) => code === 0 ? resolve() : reject(new Error(`chmod post-decompress failed: ${code}`)));
-    });
+    if (!isWin) {
+      // After decompress on Linux, file is owned by urbackup -- make it world-readable
+      await new Promise<void>((resolve, reject) => {
+        const proc = spawn('sudo', ['chmod', '644', tmpFile!]);
+        proc.on('close', (code: number) => code === 0 ? resolve() : reject(new Error(`chmod post-decompress failed: ${code}`)));
+      });
+    }
 
     const vhdStat = fs.statSync(tmpFile);
     const downloadName = fileName.replace(/\.vhdz$/, '.vhd');

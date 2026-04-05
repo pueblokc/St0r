@@ -9,6 +9,7 @@ import { decrypt } from './secrets.js';
 import { logger } from '../utils/logger.js';
 
 const execFileAsync = promisify(execFile);
+const isWindows = process.platform === 'win32';
 
 interface ReplicationTarget {
   id: string;
@@ -56,6 +57,10 @@ class ReplicationEngine {
   private locks = new Map<string, boolean>();
 
   async runTarget(targetId: string, trigger: 'hook' | 'schedule' | 'manual'): Promise<string> {
+    if (isWindows) {
+      throw new Error('Replication is not supported on Windows. This feature requires rsync, btrfs, and SSH tools that are only available on Linux.');
+    }
+
     if (this.locks.get(targetId)) {
       logger.warn(`[ReplicationEngine] Target ${targetId} already running, skipping`);
       throw new Error('A replication run is already in progress for this target');

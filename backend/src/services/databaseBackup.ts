@@ -8,8 +8,14 @@ import { logger } from '../utils/logger.js';
 
 const execFileAsync = promisify(execFile);
 
+// Platform-aware default backup directory
+const isWindows = process.platform === 'win32';
+const DEFAULT_BACKUP_DIR = isWindows
+  ? join(process.env.APPDATA || join(process.env.USERPROFILE || 'C:\\Users\\Default', 'AppData', 'Roaming'), 'urbackup-gui', 'backups')
+  : '/opt/urbackup-gui/backups';
+
 export class DatabaseBackupService {
-  private backupDir = '/opt/urbackup-gui/backups';
+  private backupDir = process.env.GUI_BACKUP_DIR || DEFAULT_BACKUP_DIR;
   private retentionDays = 30;
 
   constructor() {
